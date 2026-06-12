@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import gridstatus\")",
+      "Bash(pip install *)",
+      "Bash(python3 -m pip install gridstatus openmeteo-requests requests-cache retry-requests -q)",
+      "Bash(python3 -c \"from model.scm import make_model, make_tensors; import pandas as pd, numpy as np; print\\('scm import ok'\\)\")",
+      "Bash(python3 -c \"from model.baselines import load_and_split, baseline_lag24; print\\('baselines import ok'\\)\")",
+      "Bash(python3 -c \"import ast, sys; ast.parse\\(open\\('model/train_california.py'\\).read\\(\\)\\); print\\('train_california syntax ok'\\)\")",
+      "Bash(python3 data/fetch_california.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 *)"
+    ]
+  }
+}

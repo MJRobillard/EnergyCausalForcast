@@ -78,7 +78,7 @@ def main():
     tensors_train = make_tensors(df_train)
     tensors_test = make_tensors(df_test)
 
-    svi, guide = train(tensors_train, num_steps=5000)
+    svi, guide = train(tensors_train, num_steps=10000)
 
     y_train_pred = predict(guide, tensors_train)
     y_test_pred = predict(guide, tensors_test)
