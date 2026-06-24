@@ -17,6 +17,7 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
+import pyro
 from pathlib import Path
 from numpy.linalg import lstsq
 from sklearn.model_selection import TimeSeriesSplit
@@ -223,26 +224,15 @@ def priors_from_data(df: pd.DataFrame) -> dict:
 
 
 def load_data() -> pd.DataFrame:
-    df = pd.read_csv(DATA_DIR / "ca_merged.csv", parse_dates=["period"])
-    df["period"]  = df["period"].dt.floor("h")
-    df["hour"]    = df["period"].dt.hour.astype(float)
-    df["month"]   = df["period"].dt.month.astype(float)
-    df["dow"]     = df["period"].dt.dayofweek.astype(float)
-    date_str      = df["period"].dt.strftime("%Y-%m-%d")
-    df["holiday"] = date_str.isin(US_HOLIDAYS).astype(float)
-    df["E_lag24"]  = df["demand_mwh"].shift(24)
-    df["E_lag168"] = df["demand_mwh"].shift(168)
-    return df.sort_values("period").reset_index(drop=True)
+    """Delegate to the data pipeline layer."""
+    from data.ca_pipeline import load
+    return load(DATA_DIR / "ca_merged.csv")
 
 
 def split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Train: Sep 2023 – Aug 2024.  Test: Sep 2024 – Aug 2025.
-
-    Rows where lag features are NaN (first 168 h) are dropped from train.
-    """
-    train = df[(df["period"] < "2024-09-01") & df["E_lag168"].notna()].reset_index(drop=True)
-    test  = df[df["period"] >= "2024-09-01"].reset_index(drop=True)
-    return train, test
+    """Delegate to the data pipeline layer."""
+    from data.ca_pipeline import train_test_split
+    return train_test_split(df)
 
 
 # ── CV ────────────────────────────────────────────────────────────────────────
@@ -378,6 +368,51 @@ def main():
     }
     with open(RESULTS_DIR / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+
+    # Save param store so counterfactual analysis can be run standalone
+    pyro.get_param_store().save(str(RESULTS_DIR / "param_store.pt"))
+
+    # ── Counterfactual + decomposition analysis ───────────────────────────
+    print("\n--- Spike Decomposition & Counterfactual Analysis ---")
+    try:
+        from data.ca_pipeline import label_spikes, match_normals, make_scenario, SCENARIOS
+        from model.counterfactual import (
+            decompose_hours, uplift_decomposition, peak_scenario_summary
+        )
+        from analysis.spike_report import generate_report, print_uplift_summary, print_scenario_summary
+
+        # Decompose test predictions into components
+        print("  Decomposing test hours into SCM components ...")
+        test_decomp = decompose_hours(guide, ca_model, df_test, num_samples=200)
+        test_decomp.to_csv(RESULTS_DIR / "decomposition.csv", index=False)
+
+        # Spike vs matched normal uplift
+        df_test_labeled = label_spikes(df_test_pred)
+        spike_mask = df_test_labeled["is_top1pct"]
+        spike_decomp  = decompose_hours(guide, ca_model,
+                                        df_test_labeled[spike_mask].reset_index(drop=True))
+        normal_matched = match_normals(df_test_labeled, spike_mask)
+        if len(normal_matched) > 0:
+            normal_decomp = decompose_hours(guide, ca_model,
+                                            normal_matched.reset_index(drop=True))
+            uplift = uplift_decomposition(spike_decomp, normal_decomp)
+            uplift.to_csv(RESULTS_DIR / "spike_decomposition.csv", index=False)
+            print_uplift_summary(uplift)
+
+        # Weather scenario analysis on test set
+        print("\n  Running weather scenarios ...")
+        scenario_dfs = {name: make_scenario(df_test, spec)
+                        for name, spec in SCENARIOS.items() if name != "observed"}
+        cf_summary = peak_scenario_summary(guide, ca_model, df_test,
+                                           SCENARIOS, num_samples=100)
+        cf_summary.to_csv(RESULTS_DIR / "counterfactual_peaks.csv", index=False)
+        print_scenario_summary(cf_summary)
+
+        # Figures
+        generate_report(RESULTS_DIR)
+
+    except Exception as exc:
+        print(f"  [warn] counterfactual analysis skipped: {exc}")
 
     print(f"\nResults saved to {RESULTS_DIR}/")
 

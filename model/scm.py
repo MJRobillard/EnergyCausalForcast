@@ -56,8 +56,9 @@ def make_tensors(df: pd.DataFrame) -> dict:
     )
     # Optional extended features — present when train_california builds them
     for col, key in [("dow", "dow"), ("holiday", "holiday"),
-                     ("E_lag24", "E_lag24"), ("E_lag168", "E_lag168")]:
-        if col in df.columns:
+                     ("E_lag24", "E_lag24"), ("E_lag168", "E_lag168"),
+                     ("temp_max", "temp_max"), ("T_max_lag24", "T_max_lag24")]:
+        if col in df.columns and df[col].notna().any():
             out[key] = t(col)
     return out
 
@@ -80,7 +81,8 @@ def make_model(priors: dict | None = None):
     p = {**DEFAULT_PRIORS, **(priors or {})}
 
     def _model(h, m, T=None, RH=None, W=None, Rad=None, E_obs=None,
-               dow=None, holiday=None, E_lag24=None, E_lag168=None):
+               dow=None, holiday=None, E_lag24=None, E_lag168=None,
+               temp_max=None, T_max_lag24=None):
         """
         Full generative model.  When T/RH/W/Rad are supplied the weather
         likelihood terms are conditioned on observed values.
@@ -187,7 +189,29 @@ def make_model(priors: dict | None = None):
         mask_hot = (T_use > T_W2).float()
         E_wind = gamma_w * W_use * mask_cold - lambda_w * W_use * mask_hot
 
-        E_hvac = E_base + E_humid + E_wind
+        # Extreme inland heat: temp_max captures regional max that the
+        # load-weighted composite dilutes (e.g. Riverside 115°F during heat waves).
+        E_inland = torch.zeros(N)
+        if temp_max is not None:
+            k_max = pyro.sample("k_max", dist.Normal(0.0, 150.0))
+            T_max_base = pyro.sample("T_max_base", dist.Normal(85.0, 5.0))
+            E_inland = k_max * torch.clamp(temp_max - T_max_base, min=0.0)
+
+        # Heat persistence: yesterday's inland max drives overnight demand
+        # during multi-day heat waves via thermal mass retention.
+        E_persist = torch.zeros(N)
+        if T_max_lag24 is not None:
+            k_persist = pyro.sample("k_persist", dist.Normal(0.0, 100.0))
+            T_persist_base = pyro.sample("T_persist_base", dist.Normal(85.0, 5.0))
+            E_persist = k_persist * torch.clamp(T_max_lag24 - T_persist_base, min=0.0)
+
+        # Nonlinear cooling kink above 80°F: marginal degree of heat has
+        # larger demand impact at extreme temperatures.
+        k_cool_sq = pyro.sample("k_cool_sq", dist.Normal(0.0, 2.0))
+        cooling_sq = torch.clamp(T_use - 80.0, min=0.0) ** 2
+        E_cool_sq = k_cool_sq * cooling_sq
+
+        E_hvac = E_base + E_humid + E_wind + E_inland + E_persist + E_cool_sq
 
         # Daily activity (Eq. 11)
         Fh_act = _fourier(h, 24.0, N_HARMONICS_DAILY)   # (N, 8)
@@ -236,7 +260,23 @@ def make_model(priors: dict | None = None):
         active_hour = ((h >= LIGHTING_START) & (h < LIGHTING_END)).float()
         E_light = L0 * torch.exp(-beta * Rad_use) * active_hour
 
-        # Total demand
+        # Total demand — mark each component deterministic so Predictive
+        # exposes them for decomposition analysis.
+        pyro.deterministic("comp_lag",      E_lag,                event_dim=1)
+        pyro.deterministic("comp_cooling",  k_cool * cooling,     event_dim=1)
+        pyro.deterministic("comp_heating",  k_heat * heating,     event_dim=1)
+        pyro.deterministic("comp_inland",   E_inland,             event_dim=1)
+        pyro.deterministic("comp_persist",  E_persist,            event_dim=1)
+        pyro.deterministic("comp_cool_sq",  E_cool_sq,            event_dim=1)
+        pyro.deterministic("comp_humid",    E_humid,              event_dim=1)
+        pyro.deterministic("comp_wind",     E_wind,               event_dim=1)
+        pyro.deterministic("comp_daily",    E_daily,              event_dim=1)
+        pyro.deterministic("comp_seasonal", E_yearly,             event_dim=1)
+        pyro.deterministic("comp_dow",      E_dow,                event_dim=1)
+        pyro.deterministic("comp_holiday",  E_holiday,            event_dim=1)
+        pyro.deterministic("comp_lighting", E_light,              event_dim=1)
+        pyro.deterministic("comp_baseline", E0 * torch.ones(N),  event_dim=1)
+
         E_mu = E_hvac + E_light + E_daily + E_yearly + E_dow + E_holiday + E_lag
         pyro.deterministic("E_mu", E_mu, event_dim=1)
         sigma_E = pyro.sample("sigma_E", dist.LogNormal(4.0, 1.0))

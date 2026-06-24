@@ -30,7 +30,12 @@ results/
 Causal.pdf
 *.pdf
 *.png
+!analysis/*.png
 *.svg
+
+# Local IDE / cache
+.claude/
+.openmeteo_cache.sqlite
 
 # OS / editor metadata
 .DS_Store
